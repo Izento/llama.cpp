@@ -3629,7 +3629,19 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         filter_idx = [&](uint32_t il) {
                             return il < hparams.n_layer() && !hparams.is_recr(il) && hparams.is_indexer_full(il);
                         };
-                    } else if (arch == LLM_ARCH_FALCON_H1 || arch == LLM_ARCH_INKLING2 || arch == LLM_ARCH_INKLING2_LOOP || arch == LLM_ARCH_ZAYA1) {
+                    } else if (arch == LLM_ARCH_INKLING2_LOOP) {
+                        const char * env = getenv("LLAMA_INKLING_LAST_LOOP_KV");
+                        const bool last_loop_kv = env != nullptr && atoi(env) != 0;
+                        const uint32_t n_phys = (uint32_t) n_layer_phys();
+                        if (last_loop_kv) {
+                            LLAMA_LOG_INFO("%s: inkling2_loop: LLAMA_INKLING_LAST_LOOP_KV=1 — sharing KV cache across loop passes (%u physical layers vs %u visits; conv states stay per-visit)\n",
+                                    __func__, n_phys, hparams.n_layer());
+                        }
+                        filter_attn = [last_loop_kv, n_phys](uint32_t il) {
+                            return !last_loop_kv || il < n_phys;
+                        };
+                        filter_recr = [&](uint32_t) { return true; };
+                    } else if (arch == LLM_ARCH_FALCON_H1 || arch == LLM_ARCH_INKLING2 || arch == LLM_ARCH_ZAYA1) {
                         filter_attn = [&](uint32_t) { return true; };
                         filter_recr = [&](uint32_t) { return true; };
                     } else if (arch == LLM_ARCH_INKLING) {

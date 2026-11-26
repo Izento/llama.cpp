@@ -31,6 +31,14 @@ static int inkling2_banded_pos_mode() {
     return mode;
 }
 
+static bool inkling2_last_loop_kv_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("LLAMA_INKLING_LAST_LOOP_KV");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    return enabled;
+}
+
 void llama_model_inkling2::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
     ml.get_key(LLM_KV_ATTENTION_QK_CLIP,           hparams.f_qk_clip);
@@ -577,10 +585,14 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
 
         ggml_tensor * sinks = build_lora_mm(layer.attn_sink_proj, inputs[0]);
 
-        if (use_banded(il, is_swa)) {
+        // last_loop KV sharing (opt-in via LLAMA_INKLING_LAST_LOOP_KV=1):
+        // all loop passes share the physical layer's KV slot (ip) while conv state stays per-visit (il)
+        const int il_kv = (model.arch == LLM_ARCH_INKLING2_LOOP && inkling2_last_loop_kv_enabled()) ? ip : il;
+
+        if (use_banded(il_kv, is_swa)) {
             const auto * cache = is_swa ? attn->mctx->get_swa() : attn->mctx->get_base();
-            auto * k_rot = is_swa ? attn->self_k_rot_swa[il] : attn->self_k_rot[il];
-            auto * v_rot = is_swa ? attn->self_v_rot_swa[il] : attn->self_v_rot[il];
+            auto * k_rot = is_swa ? attn->self_k_rot_swa[il_kv] : attn->self_k_rot[il_kv];
+            auto * v_rot = is_swa ? attn->self_v_rot_swa[il_kv] : attn->self_v_rot[il_kv];
             if (k_rot) {
                 Qcur = llama_mul_mat_hadamard(ctx0, Qcur, k_rot);
                 Kcur = llama_mul_mat_hadamard(ctx0, Kcur, k_rot);
@@ -591,12 +603,12 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
             ggml_build_forward_expand(gf, Qcur);
             ggml_build_forward_expand(gf, Kcur);
             ggml_build_forward_expand(gf, Vcur);
-            ggml_build_forward_expand(gf, cache->cpy_k(ctx0, Kcur, is_swa ? attn->get_k_idxs_swa() : attn->get_k_idxs(), il));
-            ggml_build_forward_expand(gf, cache->cpy_v(ctx0, Vcur, is_swa ? attn->get_v_idxs_swa() : attn->get_v_idxs(), il));
+            ggml_build_forward_expand(gf, cache->cpy_k(ctx0, Kcur, is_swa ? attn->get_k_idxs_swa() : attn->get_k_idxs(), il_kv));
+            ggml_build_forward_expand(gf, cache->cpy_v(ctx0, Vcur, is_swa ? attn->get_v_idxs_swa() : attn->get_v_idxs(), il_kv));
 
             const int64_t n_kv_b = inp->n_kv_banded[is_swa];
-            ggml_tensor * k_all = cache->get_k(ctx0, il);
-            ggml_tensor * v_all = cache->get_v(ctx0, il);
+            ggml_tensor * k_all = cache->get_k(ctx0, il_kv);
+            ggml_tensor * v_all = cache->get_v(ctx0, il_kv);
             GGML_ASSERT(n_kv_b <= k_all->ne[2]);
             ggml_tensor * q_fa = ggml_permute(ctx0, ggml_reshape_4d(ctx0, Qcur, n_embd_head, n_head, n_tokens, 1), 0, 2, 1, 3);
             ggml_tensor * k_fa = ggml_permute(ctx0, ggml_view_4d(ctx0, k_all, k_all->ne[0], k_all->ne[1], n_kv_b, k_all->ne[3],
@@ -611,7 +623,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
                         v_all->nb[1], v_all->nb[2], v_all->nb[3], 0), 0, 2, 1, 3);
             }
             // the causal attention without a mask runs on the CUDA and CPU kernels only
-            ggml_backend_dev_t dev = model.dev_layer(il);
+            ggml_backend_dev_t dev = model.dev_layer(il_kv);
             const char * reg = dev ? ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)) : "";
             const bool causal = !is_swa && banded_causal && (strcmp(reg, "CUDA") == 0 || strcmp(reg, "CPU") == 0);
             ggml_tensor * m = nullptr;
@@ -657,7 +669,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
             table = ggml_cont(ctx0, ggml_permute(ctx0, table, 1, 0, 2, 3));
 
             // zero sinks, filled once per graph and layer device
-            ggml_tensor *& zero = clip_limits[{ { model.dev_layer(il), -n_head }, 0.0f }];
+            ggml_tensor *& zero = clip_limits[{ { model.dev_layer(il_kv), -n_head }, 0.0f }];
             if (!zero) {
                 zero = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_head), 0.0f);
             }
@@ -712,7 +724,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
                 // only the first chunk stores K and V
                 ggml_tensor * out = build_attn(inp,
                         nullptr, nullptr, nullptr,
-                        q_c, r0 == 0 ? Kcur : nullptr, r0 == 0 ? Vcur : nullptr, kq_b, sinks, 1.0f/sqrtf(n_embd_head), il, r0);
+                        q_c, r0 == 0 ? Kcur : nullptr, r0 == 0 ? Vcur : nullptr, kq_b, sinks, 1.0f/sqrtf(n_embd_head), il_kv, r0);
                 if (all) {
                     cur = out;
                     break;
