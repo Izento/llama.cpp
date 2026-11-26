@@ -1,0 +1,334 @@
+name: "Praeco: Windows ROCm gfx103X Build"
+
+on:
+  workflow_dispatch:
+    inputs:
+      gpu_targets:
+        description: 'HIP GPU_TARGETS (e.g. gfx1031 or gfx1030;gfx1031;gfx1032;gfx1034)'
+        required: false
+        default: 'gfx1031'
+        type: string
+      rocm_version:
+        description: 'TheRock ROCm version (e.g. 10.3.0a20261107), "weekly", or "latest"'
+        required: false
+        default: 'weekly'
+        type: string
+      stage_label:
+        description: 'Artifact label (e.g. stageA or stageB)'
+        required: false
+        default: 'stageA'
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows-rocm:
+    name: windows/rocm (${{ inputs.gpu_targets }})
+    runs-on: windows-2022
+    timeout-minutes: 240
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          path: llama.cpp
+          fetch-depth: 1
+
+      - name: Ensure Visual Studio 2022 Build Tools (MSVC 14.44)
+        run: |
+          $vswhere = "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsPath = ""
+          if (Test-Path $vswhere) {
+            $vsPath = (& $vswhere -latest -version "[17.0,18.0)" -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath | Select-Object -First 1)
+          }
+          if ($vsPath -and (Test-Path "$vsPath\VC\Auxiliary\Build\vcvars64.bat")) {
+            Write-Host "Found existing VS 2022 installation at: $vsPath"
+          } else {
+            Write-Host "Installing VS 2022 Build Tools..."
+            $vsInstallerUrl = "https://aka.ms/vs/17/release/vs_buildtools.exe"
+            $vsInstallerPath = "$env:TEMP\vs_buildtools.exe"
+            for ($i = 1; $i -le 5; $i++) {
+              try {
+                Invoke-WebRequest -Uri $vsInstallerUrl -OutFile $vsInstallerPath -ErrorAction Stop
+                break
+              } catch {
+                if ($i -eq 5) { throw }
+                Start-Sleep -Seconds (10 * $i)
+              }
+            }
+            Start-Process -FilePath $vsInstallerPath -ArgumentList "--quiet", "--wait", "--norestart", "--add", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64", "--add", "Microsoft.VisualStudio.Component.VC.CMake.Project", "--add", "Microsoft.VisualStudio.Component.VC.ATL", "--add", "Microsoft.VisualStudio.Component.Windows11SDK.22621" -Wait
+            Remove-Item $vsInstallerPath -Force
+          }
+
+      - name: Install Ninja and verify Perl
+        run: |
+          function Invoke-DownloadWithRetry {
+            param([string]$Uri, [string]$OutFile, [int]$Retries = 5, [int]$DelaySec = 10)
+            for ($i = 1; $i -le $Retries; $i++) {
+              try {
+                Invoke-WebRequest -Uri $Uri -OutFile $OutFile -ErrorAction Stop
+                return
+              } catch {
+                Write-Host "Download attempt $i/$Retries failed: $($_.Exception.Message)"
+                if ($i -eq $Retries) { throw }
+                Start-Sleep -Seconds ($DelaySec * $i)
+              }
+            }
+          }
+          $ninjaUrl = "https://github.com/ninja-build/ninja/releases/download/v1.11.1/ninja-win.zip"
+          $ninjaPath = "$env:TEMP\ninja-win.zip"
+          $ninjaDir = "C:\ninja"
+          New-Item -ItemType Directory -Force -Path $ninjaDir | Out-Null
+          Invoke-DownloadWithRetry -Uri $ninjaUrl -OutFile $ninjaPath
+          Expand-Archive -Path $ninjaPath -DestinationPath $ninjaDir -Force
+
+          if (-not (Get-Command perl -ErrorAction SilentlyContinue)) {
+            choco install strawberryperl -y --no-progress
+            if ($LASTEXITCODE -ne 0) { throw "choco install strawberryperl failed ($LASTEXITCODE)" }
+          }
+          "C:\ninja" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+          "C:\Strawberry\perl\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+          & "C:\ninja\ninja.exe" --version
+
+      - name: Resolve and download TheRock Windows gfx103X-all ROCm SDK
+        run: |
+          function Invoke-DownloadWithRetry {
+            param([string]$Uri, [string]$OutFile, [int]$Retries = 5, [int]$DelaySec = 10)
+            for ($i = 1; $i -le $Retries; $i++) {
+              try {
+                Invoke-WebRequest -Uri $Uri -OutFile $OutFile -ErrorAction Stop
+                return
+              } catch {
+                Write-Host "Download attempt $i/$Retries for $Uri failed: $($_.Exception.Message)"
+                if ($i -eq $Retries) { throw }
+                Start-Sleep -Seconds ($DelaySec * $i)
+              }
+            }
+          }
+
+          $rocmVersion = "${{ inputs.rocm_version }}"
+          $archiveTarget = "gfx103X-all"
+          $baseUrl = "https://nightly.repo.amd.com/rocm/core/tarball"
+          $windowsMaxNightly = "20261107"
+
+          if ($rocmVersion -eq "latest" -or $rocmVersion -eq "weekly") {
+            $cutoff = $windowsMaxNightly
+            foreach ($i in 1..3) {
+              try { $indexHtml = (Invoke-WebRequest "$baseUrl/" -UseBasicParsing -ErrorAction Stop).Content; break }
+              catch {
+                if ($i -eq 3) { throw }
+                Start-Sleep -Seconds (20 * $i)
+              }
+            }
+            $filesMatch = [regex]::Match($indexHtml, 'const files = (\[.*?\]);', [System.Text.RegularExpressions.RegexOptions]::Singleline)
+            if (-not $filesMatch.Success) { throw "Failed to parse file index from $baseUrl/" }
+
+            $allFiles = $filesMatch.Groups[1].Value | ConvertFrom-Json
+            $prefix = "therock-dist-windows-$archiveTarget-"
+            $versionPattern = "^$([regex]::Escape($prefix))\d+\.\d+\.\d+(a|rc)\d+\.tar\.gz$"
+            $latest = $allFiles |
+              Where-Object { $_.name -match $versionPattern } |
+              Where-Object { [regex]::Match($_.name, '(\d{8})\.tar\.gz$').Groups[1].Value -le $cutoff } |
+              Sort-Object { [regex]::Match($_.name, '(\d{8})\.tar\.gz$').Groups[1].Value } |
+              Select-Object -Last 1
+            if (-not $latest) { throw "No tarball found for $prefix <= $cutoff" }
+            $latestFile = $latest.name
+            if ($latestFile -match "therock-dist-windows-$archiveTarget-(\d+\.\d+\.\d+(?:a|rc)\d+)\.tar\.gz") {
+              $rocmVersion = $matches[1]
+            } else {
+              throw "Unexpected filename: $latestFile"
+            }
+            $rocmUrl = "$baseUrl/$latestFile"
+          } else {
+            $rocmUrl = "$baseUrl/therock-dist-windows-$archiveTarget-$rocmVersion.tar.gz"
+          }
+
+          "DETECTED_ROCM_VERSION=$rocmVersion" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          Write-Host "Downloading TheRock ROCm $rocmVersion from $rocmUrl"
+          Invoke-DownloadWithRetry -Uri $rocmUrl -OutFile "rocm.tar.gz"
+
+          if (Test-Path "C:\opt\rocm") { Remove-Item -Recurse -Force "C:\opt\rocm" }
+          New-Item -ItemType Directory -Force -Path "C:\opt\rocm" | Out-Null
+          tar -xzf rocm.tar.gz -C C:\opt\rocm --strip-components=1
+          Remove-Item "rocm.tar.gz" -Force
+
+      - name: ccache
+        continue-on-error: true
+        uses: hendrikmuhs/ccache-action@d62db5f07c26379fc4b4e0916f098a92573c3b03  # v1.2.23
+        with:
+          key: praeco-rocm-win-${{ inputs.gpu_targets }}-${{ env.DETECTED_ROCM_VERSION }}-${{ github.sha }}
+          restore-keys: |
+            praeco-rocm-win-${{ inputs.gpu_targets }}-${{ env.DETECTED_ROCM_VERSION }}-
+          append-timestamp: false
+          variant: ccache
+          max-size: 2G
+          save: false
+
+      - name: Configure ccache
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $have = ((& ccache --version 2>$null | Select-Object -First 1) -split '\s+')[2]
+          $ok = $false
+          if ($have) { try { $ok = [version]($have -replace '[^0-9.].*$','') -ge [version]'4.10' } catch { $ok = $false } }
+          if ($ok) {
+            ccache --set-config=compiler_check=content
+            ccache --set-config=sloppiness=include_file_mtime,include_file_ctime,pch_defines,locale
+            ccache --set-config=compression_level=6
+            "CCACHE_LAUNCHER=ccache" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          } else {
+            Write-Output "::warning::ccache unusable (found '$have'); building without cache"
+            "CCACHE_LAUNCHER=" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          }
+
+      - name: Configure CMake (Clang + HIP + CPU all-variants)
+        shell: cmd
+        run: |
+          set HIP_PATH=C:\opt\rocm
+          set HIP_PLATFORM=amd
+          set PATH=%HIP_PATH%\lib\llvm\bin;%HIP_PATH%\bin;C:\ninja;C:\Strawberry\perl\bin;%PATH%
+
+          call "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe" -latest -version "[17.0,18.0)" -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath > vs_path.txt
+          set /p VS_PATH=<vs_path.txt
+          call "%VS_PATH%\VC\Auxiliary\Build\vcvars64.bat"
+
+          > "%RUNNER_TEMP%\rocm-env.cmd" echo set HIP_PATH=C:\opt\rocm
+          >> "%RUNNER_TEMP%\rocm-env.cmd" echo set HIP_PLATFORM=amd
+          >> "%RUNNER_TEMP%\rocm-env.cmd" echo set PATH=C:\opt\rocm\lib\llvm\bin;C:\opt\rocm\bin;C:\ninja;C:\Strawberry\perl\bin;%%PATH%%
+          >> "%RUNNER_TEMP%\rocm-env.cmd" echo call "%VS_PATH%\VC\Auxiliary\Build\vcvars64.bat"
+
+          cd llama.cpp
+          mkdir build
+          cd build
+
+          cmake .. -G Ninja ^
+            -DCMAKE_C_COMPILER="C:\opt\rocm\lib\llvm\bin\clang.exe" ^
+            -DCMAKE_CXX_COMPILER="C:\opt\rocm\lib\llvm\bin\clang++.exe" ^
+            -DCMAKE_C_FLAGS="-Wno-error=incompatible-pointer-types" ^
+            -DCMAKE_CXX_FLAGS="-IC:\opt\rocm\include" ^
+            -DCMAKE_BUILD_TYPE=Release ^
+            -DGPU_TARGETS="${{ inputs.gpu_targets }}" ^
+            -DBUILD_SHARED_LIBS=ON ^
+            -DLLAMA_BUILD_TESTS=OFF ^
+            -DGGML_HIP=ON ^
+            -DGGML_OPENMP=OFF ^
+            -DGGML_CUDA_FORCE_CUBLAS=OFF ^
+            -DGGML_RPC=ON ^
+            -DGGML_HIP_ROCWMMA_FATTN=OFF ^
+            -DLLAMA_BUILD_BORINGSSL=ON ^
+            -DBORINGSSL_GIT=https://github.com/google/boringssl.git ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_STATIC=OFF ^
+            -DGGML_BACKEND_DL=ON ^
+            -DGGML_CPU_ALL_VARIANTS=ON ^
+            -DCMAKE_C_COMPILER_LAUNCHER=${{ env.CCACHE_LAUNCHER }} ^
+            -DCMAKE_CXX_COMPILER_LAUNCHER=${{ env.CCACHE_LAUNCHER }}
+          if errorlevel 1 exit /b 1
+
+      - name: Build llama.cpp + ggml-hip
+        shell: cmd
+        run: |
+          call "%RUNNER_TEMP%\rocm-env.cmd"
+          cd llama.cpp\build
+          cmake --build . -j %NUMBER_OF_PROCESSORS%
+          if errorlevel 1 exit /b 1
+
+      - name: Copy ROCm core DLLs and libraries
+        run: |
+          $buildBinPath = "llama.cpp\build\bin"
+          $rocmBinPath = "C:\opt\rocm\bin"
+          $filesToCopy = @(
+            "amdhip64_*.dll",
+            "rocm_kpack.dll",
+            "amd_comgr*.dll",
+            "libhipblas.dll",
+            "rocblas.dll",
+            "rocsolver.dll",
+            "hipblaslt.dll",
+            "libhipblaslt.dll",
+            "hipblas.dll",
+            "origami.dll",
+            "libtensilelite-host.dll"
+          )
+          foreach ($pattern in $filesToCopy) {
+            Get-ChildItem -Path $rocmBinPath -Name $pattern -ErrorAction SilentlyContinue | ForEach-Object {
+              Copy-Item (Join-Path $rocmBinPath $_) (Join-Path $buildBinPath $_) -Force
+              Write-Host "Copied: $_"
+            }
+          }
+          foreach ($sub in @("rocblas\library", "hipblaslt\library")) {
+            $src = Join-Path $rocmBinPath $sub
+            if (Test-Path $src) {
+              Copy-Item -Path $src -Destination (Join-Path $buildBinPath $sub) -Recurse -Force
+              Write-Host "Copied: $sub"
+            }
+          }
+
+      - name: Relocate rocBLAS kernel packs
+        run: |
+          python llama.cpp\scripts\unsloth\relocate_kpack.py `
+            --bundle llama.cpp\build\bin `
+            --kpack-src C:\opt\rocm\.kpack `
+            --archs "${{ inputs.gpu_targets }}"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Verify every imported ROCm DLL is in bundle
+        run: |
+          python -m pip install --quiet --disable-pip-version-check pefile
+          @'
+          import os, sys, pefile
+          bundle, rocm = r"llama.cpp\build\bin", r"C:\opt\rocm\bin"
+          have = {f.lower() for f in os.listdir(bundle)}
+          rocm_dlls = {f.lower() for f in os.listdir(rocm) if f.lower().endswith(".dll")}
+          dirs = [pefile.DIRECTORY_ENTRY[d] for d in ("IMAGE_DIRECTORY_ENTRY_IMPORT", "IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT")]
+          missing = []
+          for name in sorted(have):
+              if not name.endswith((".dll", ".exe")):
+                  continue
+              pe = pefile.PE(os.path.join(bundle, name), fast_load=True)
+              pe.parse_data_directories(directories=dirs)
+              for entry in getattr(pe, "DIRECTORY_ENTRY_IMPORT", []) + getattr(pe, "DIRECTORY_ENTRY_DELAY_IMPORT", []):
+                  dep = entry.dll.decode().lower()
+                  if dep in rocm_dlls and dep not in have:
+                      missing.append(f"{name} -> {dep}")
+          if missing:
+              print("\n".join(missing))
+              sys.exit(1)
+          print("All imported ROCm DLLs verified in bundle.")
+          '@ | python -
+
+      - name: Write BUILD_INFO.txt and package zip
+        shell: bash
+        run: |
+          set -eux
+          SHORT_SHA="${GITHUB_SHA::7}"
+          TARGET_TAG="${{ inputs.gpu_targets }}"
+          TARGET_TAG="${TARGET_TAG//;/-}"
+          ASSET="praeco-llama-${{ inputs.stage_label }}-${SHORT_SHA}-win-x64-rocm-${TARGET_TAG}.zip"
+          printf "repo=%s\nref=%s\nsha=%s\nstage=%s\nrocm=%s\ngpu_targets=%s\n" \
+            "${GITHUB_REPOSITORY}" "${GITHUB_REF_NAME}" "${GITHUB_SHA}" \
+            "${{ inputs.stage_label }}" "${DETECTED_ROCM_VERSION}" "${{ inputs.gpu_targets }}" \
+            > llama.cpp/build/bin/BUILD_INFO.txt
+          mkdir -p dist
+          (cd llama.cpp/build/bin && 7z a -tzip "${GITHUB_WORKSPACE}/dist/${ASSET}" .)
+          ls -lh dist
+
+      - name: Upload Windows ROCm bundle artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: praeco-llama-${{ inputs.stage_label }}-win-x64-rocm
+          path: dist/*.zip
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: ccache stats & save
+        if: always()
+        continue-on-error: true
+        run: ccache --show-stats
+
+      - name: Save ccache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ github.workspace }}\.ccache
+          key: praeco-rocm-win-${{ inputs.gpu_targets }}-${{ env.DETECTED_ROCM_VERSION }}-${{ github.sha }}

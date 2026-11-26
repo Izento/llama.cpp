@@ -1695,6 +1695,7 @@ struct llama_model_dflash : public llama_model_base {
     variant_type  variant  = VARIANT_DFLASH;
     backbone_type backbone = BACKBONE_BASE;
 
+    void load_hparams_dflash2(llama_model_loader & ml);
     void load_hparams_lilicorr(llama_model_loader & ml);
     void load_hparams_dsv4(llama_model_loader & ml);
     void load_hparams_mistral_large4(llama_model_loader & ml);
@@ -1735,6 +1736,7 @@ struct llama_model_dflash : public llama_model_base {
         void          build_inject_ctx_mix();
         void          store_inject_kv(ggml_tensor * Kcur, ggml_tensor * Vcur, int il);
         ggml_tensor * build_inp_tokens();
+        ggml_tensor * apply_dflash2_target_norm(ggml_tensor * embd);
         ggml_tensor * build_layers(ggml_tensor * inp_tokens);
         ggml_tensor * build_inkling2_embd(ggml_tensor * inp_tokens);
         ggml_tensor * mix_target_features(ggml_tensor * features, int row, ggml_tensor * norm);

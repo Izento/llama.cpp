@@ -84,6 +84,10 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
         }
         hparams.dspark_context_rank = (uint32_t) rank;
     }
+
+    if (variant == VARIANT_DFLASH2) {
+        load_hparams_dflash2(ml);
+    }
     hparams.n_embd_inp_enc_impl = (uint32_t) target_layer_ids.size() * hparams.n_embd;
 
     std::string layers;
@@ -506,6 +510,9 @@ ggml_tensor * llama_model_dflash::graph_base::build_layers(ggml_tensor * inp_tok
     ggml_tensor * inpL = model.dspark_fuse      ? build_inkling2_embd(inp_tokens) :
                          model.dspark_mask_embd ? build_dspark_inp_block(*this, model, inp_tokens) :
                                                   ggml_get_rows(ctx0, get_tok_embd(*this, model), inp_tokens);
+    if (model.dflash_selector_hidden) {
+        inpL = apply_dflash2_target_norm(inpL);
+    }
     if (hparams.f_embedding_scale != 0.0f) {
         inpL = ggml_scale(ctx0, inpL, hparams.f_embedding_scale);
     }
@@ -628,7 +635,7 @@ ggml_tensor * llama_model_dflash::graph_base::build_logits(ggml_tensor * cur) {
         if (hparams.f_logit_scale != 0.0f) {
             cur = ggml_scale(ctx0, cur, hparams.f_logit_scale);
         }
-        if (hparams.f_final_logit_softcapping > 0.0f) {
+        if (hparams.f_final_logit_softcapping > 0.0f && !hparams.dflash_selector_softcap_post) {
             cur = ggml_scale(ctx0, cur, 1.0f / hparams.f_final_logit_softcapping);
             cur = ggml_tanh(ctx0, cur);
             cur = ggml_scale(ctx0, cur, hparams.f_final_logit_softcapping);
