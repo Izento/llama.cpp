@@ -1,6 +1,16 @@
 #include "models.h"
 #include "../llama-memory-hybrid-iswa.h"
 
+#include <cstdlib>
+
+static bool inkling2_last_loop_kv_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("LLAMA_INKLING_LAST_LOOP_KV");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    return enabled;
+}
+
 void llama_model_inkling2::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
     ml.get_key(LLM_KV_ATTENTION_QK_CLIP,           hparams.f_qk_clip);
@@ -385,9 +395,17 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         }
         sinks = zero;
 
+        // last_loop KV sharing (opt-in via LLAMA_INKLING_LAST_LOOP_KV=1):
+        // all loop passes share the physical layer's KV slot (ip) while conv state stays per-visit (il)
+        const bool last_loop_kv = (model.arch == LLM_ARCH_INKLING2_LOOP && inkling2_last_loop_kv_enabled());
+        const int il_kv = last_loop_kv ? ip : il;
+
         cur = build_attn(inp,
                 nullptr, nullptr, nullptr,
-                Qcur, Kcur, Vcur, table, sinks, 1.0f/sqrtf(n_embd_head), il);
+                Qcur, Kcur, Vcur, table, sinks, 1.0f/sqrtf(n_embd_head), il_kv);
+        if (last_loop_kv) {
+            ggml_build_forward_expand(gf, cur);
+        }
 
         cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, build_lora_mm(layer.wqkv_gate, inputs[0])));
         cur = convolve(build_lora_mm(layer.wo, cur), layer.attn_post_conv, nullptr, state, history, recr, 2*n_embd_k_gqa);
